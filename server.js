@@ -6,6 +6,8 @@ const fs = require('fs');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const mongoose = require('mongoose');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const app = express();
 
 // MongoDB Connection
@@ -25,7 +27,7 @@ const studentSchema = new mongoose.Schema({
     penNo: { type: String, required: true },
     apaarId: { type: String, required: true },
     srNo: { type: String, required: true },
-    class: { type: String, required: true },
+    class: { type: String, required: true, lowercase: true, trim: true },
     section: { type: String, required: true },
     rollNo: String,
     email: { type: String, required: true },
@@ -78,11 +80,39 @@ const admissionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
+const teacherSchema = new mongoose.Schema({
+    teacherId: { type: String, required: true, unique: true },
+    name: { type: String, required: true },
+    password: { type: String, required: true },
+    assignedClass: { type: String, required: true, lowercase: true, trim: true },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const studentAttendanceSchema = new mongoose.Schema({
+    studentId: { type: String, required: true },
+    date: { type: Date, required: true },
+    status: { type: String, enum: ['Present', 'Absent'], required: true },
+    class: { type: String, required: true, lowercase: true, trim: true },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const teacherAttendanceSchema = new mongoose.Schema({
+    teacherId: { type: String, required: true },
+    date: { type: Date, required: true },
+    status: { type: String, enum: ['Present', 'Absent'], required: true },
+    createdAt: { type: Date, default: Date.now }
+}); 
+
 const Admission = mongoose.model('Admission', admissionSchema);
+const Teacher = mongoose.model('Teacher', teacherSchema);
+const StudentAttendance = mongoose.model('StudentAttendance', studentAttendanceSchema);
+const TeacherAttendance = mongoose.model('TeacherAttendance', teacherAttendanceSchema);
 
 // Configuration
 const PORT = process.env.PORT || 3000;
-const UPLOAD_DIR = 'uploads/';
+const UPLOAD_DIR = 'Uploads/';
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'your_admin_secret';
 if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR);
 }
@@ -92,6 +122,32 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static('public'));
+
+// Authentication Middleware
+const authenticateTeacher = async (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const teacher = await Teacher.findOne({ teacherId: decoded.teacherId });
+        if (!teacher) return res.status(401).json({ error: 'Invalid token' });
+        req.teacher = teacher;
+        next();
+    } catch (error) {
+        console.error('Authentication error:', error);
+        res.status(401).json({ error: 'Invalid token' });
+    }
+};
+
+// Admin Middleware
+const authenticateAdmin = (req, res, next) => {
+    const adminSecret = req.headers['x-admin-secret'];
+    if (!adminSecret || adminSecret !== ADMIN_SECRET) {
+        return res.status(403).json({ error: 'Unauthorized: Invalid admin secret' });
+    }
+    next();
+};
 
 // Multer Configuration
 const storage = multer.diskStorage({
@@ -121,19 +177,96 @@ const upload = multer({
 
 // API Endpoints
 
-// Get all admissions with pagination and filtering
-app.get('/api/admissions', async (req, res) => {
+// Create Teacher (Admin Only)
+app.post('/api/teachers', authenticateAdmin, async (req, res) => {
+    try {
+        const { name, assignedClass, password = 'Teacher@123' } = req.body;
+
+        if (!name || !assignedClass) {
+            return res.status(400).json({ error: 'Name and assignedClass are required' });
+        }
+
+        // Generate unique teacherId
+        const lastTeacher = await Teacher.findOne().sort({ teacherId: -1 });
+        let newIdNum = 1;
+        if (lastTeacher && lastTeacher.teacherId.startsWith('TCH')) {
+            const lastIdNum = parseInt(lastTeacher.teacherId.replace('TCH', ''));
+            newIdNum = lastIdNum + 1;
+        }
+        const teacherId = `TCH${String(newIdNum).padStart(3, '0')}`; // e.g., TCH001
+
+        // Hash password
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        const teacher = new Teacher({
+            teacherId,
+            name,
+            password: hashedPassword,
+            assignedClass
+        });
+
+        await teacher.save();
+        res.status(201).json({ success: true, teacherId, name, assignedClass, password });
+    } catch (error) {
+        console.error('Error creating teacher:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+// Get Teachers List (Admin Only)
+app.get('/api/teachers/list', authenticateAdmin, async (req, res) => {
+    try {
+        const teachers = await Teacher.find({}, 'teacherId name assignedClass').sort({ teacherId: 1 });
+        res.json({ success: true, teachers });
+    } catch (error) {
+        console.error('Error fetching teachers:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+// Teacher Login
+app.post('/api/teachers/login', async (req, res) => {
+    try {
+        const { teacherId, password } = req.body;
+        if (!teacherId || !password) {
+            return res.status(400).json({ error: 'Teacher ID and password are required' });
+        }
+
+        const teacher = await Teacher.findOne({ teacherId });
+        if (!teacher) return res.status(400).json({ error: 'Invalid credentials' });
+
+        const isMatch = await bcrypt.compare(password, teacher.password);
+        if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
+
+        const token = jwt.sign({ teacherId: teacher.teacherId }, JWT_SECRET, { expiresIn: '1h' });
+        res.json({ success: true, teacher: { teacherId: teacher.teacherId, name: teacher.name, assignedClass: teacher.assignedClass }, token });
+    } catch (error) {
+        console.error('Error logging in teacher:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+// Verify Token
+app.get('/api/teachers/verify', authenticateTeacher, async (req, res) => {
+    try {
+        res.json({ teacher: { teacherId: req.teacher.teacherId, name: req.teacher.name, assignedClass: req.teacher.assignedClass } });
+    } catch (error) {
+        console.error('Error verifying token:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+// Get All Admissions (Restricted to Teacher's Class)
+app.get('/api/admissions', authenticateTeacher, async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
         const skip = (page - 1) * limit;
-        const grade = req.query.grade;
-        const status = req.query.status;
+        const grade = req.query.grade ? req.query.grade.toLowerCase() : undefined;
         const search = req.query.search;
 
-        const query = {};
+        const query = { 'student.class': req.teacher.assignedClass.toLowerCase() }; // Restrict to teacher's class
         if (grade) query['student.class'] = grade;
-        if (status) query.status = status;
         if (search) {
             query.$or = [
                 { 'student.firstName': { $regex: search, $options: 'i' } },
@@ -155,11 +288,11 @@ app.get('/api/admissions', async (req, res) => {
         });
     } catch (error) {
         console.error('Error fetching admissions:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: 'Internal server error', details: error.message });
     }
 });
 
-// Submit admission form
+// Submit Admission Form
 app.post('/api/admissions', upload.fields([
     { name: 'studentPhoto', maxCount: 1 },
     { name: 'aadhaarCard', maxCount: 1 },
@@ -173,7 +306,6 @@ app.post('/api/admissions', upload.fields([
         const formData = req.body;
         const files = req.files;
 
-        // Validate required fields
         if (!formData.student || !formData.parents) {
             return res.status(400).json({ error: 'Student and parent data are required' });
         }
@@ -185,7 +317,6 @@ app.post('/api/admissions', upload.fields([
             return res.status(400).json({ error: 'Required fields missing' });
         }
 
-        // Process uploaded files
         const fileReferences = {};
         if (files) {
             Object.keys(files).forEach(field => {
@@ -193,10 +324,8 @@ app.post('/api/admissions', upload.fields([
             });
         }
 
-        // Generate admission ID
         const admissionId = 'ADM-' + Date.now();
 
-        // Create admission record
         const admissionRecord = new Admission({
             admissionId,
             student: {
@@ -254,7 +383,6 @@ app.post('/api/admissions', upload.fields([
             status: formData.status || 'pending'
         });
 
-        // Save to MongoDB
         await admissionRecord.save();
 
         res.status(201).json({
@@ -268,7 +396,7 @@ app.post('/api/admissions', upload.fields([
     }
 });
 
-// Update admission
+// Update Admission
 app.put('/api/admissions/:id', async (req, res) => {
     try {
         const admission = await Admission.findOne({ admissionId: req.params.id });
@@ -333,7 +461,7 @@ app.put('/api/admissions/:id', async (req, res) => {
     }
 });
 
-// Delete admission
+// Delete Admission
 app.delete('/api/admissions/:id', async (req, res) => {
     try {
         const admission = await Admission.findOneAndDelete({ admissionId: req.params.id });
@@ -347,7 +475,7 @@ app.delete('/api/admissions/:id', async (req, res) => {
     }
 });
 
-// Get single admission
+// Get Single Admission
 app.get('/api/admissions/:id', async (req, res) => {
     try {
         const admission = await Admission.findOne({ admissionId: req.params.id });
@@ -361,13 +489,167 @@ app.get('/api/admissions/:id', async (req, res) => {
     }
 });
 
-// Download document
+// Download Document
 app.get('/api/documents/:filename', (req, res) => {
     const filePath = path.join(__dirname, UPLOAD_DIR, req.params.filename);
     if (fs.existsSync(filePath)) {
         res.download(filePath);
     } else {
         res.status(404).json({ error: 'File not found' });
+    }
+});
+
+// Student Attendance Endpoints
+app.get('/api/attendance/students', authenticateTeacher, async (req, res) => {
+    try {
+        const { date, class: className } = req.query;
+        if (!date || !className) return res.status(400).json({ error: 'Date and class are required' });
+
+        if (className.toLowerCase() !== req.teacher.assignedClass.toLowerCase()) {
+            return res.status(403).json({ error: 'Unauthorized: You can only access your assigned class' });
+        }
+
+        const startOfDay = new Date(date);
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date(date);
+        endOfDay.setHours(23, 59, 59, 999);
+
+        const attendance = await StudentAttendance.find({
+            date: { $gte: startOfDay, $lte: endOfDay },
+            class: className.toLowerCase()
+        });
+
+        res.json(attendance);
+    } catch (error) {
+        console.error('Error fetching student attendance:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+app.post('/api/attendance/students', authenticateTeacher, async (req, res) => {
+    try {
+        const attendanceRecords = req.body;
+        if (!Array.isArray(attendanceRecords)) return res.status(400).json({ error: 'Invalid data format' });
+
+        for (const record of attendanceRecords) {
+            if (record.class.toLowerCase() !== req.teacher.assignedClass.toLowerCase()) {
+                return res.status(403).json({ error: 'Unauthorized: You can only mark attendance for your assigned class' });
+            }
+
+            const startOfDay = new Date(record.date);
+            startOfDay.setHours(0, 0, 0, 0);
+            const endOfDay = new Date(record.date);
+            endOfDay.setHours(23, 59, 59, 999);
+
+            await StudentAttendance.deleteOne({
+                studentId: record.studentId,
+                date: { $gte: startOfDay, $lte: endOfDay }
+            });
+
+            const attendance = new StudentAttendance({
+                studentId: record.studentId,
+                date: record.date,
+                status: record.status,
+                class: record.class.toLowerCase()
+            });
+            await attendance.save();
+        }
+
+        res.json({ success: true, message: 'Student attendance saved successfully' });
+    } catch (error) {
+        console.error('Error saving student attendance:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+app.get('/api/attendance/students/history/:studentId', authenticateTeacher, async (req, res) => {
+    try {
+        const attendance = await StudentAttendance.find({
+            studentId: req.params.studentId,
+            class: req.teacher.assignedClass.toLowerCase()
+        }).sort({ date: -1 });
+        res.json(attendance);
+    } catch (error) {
+        console.error('Error fetching student attendance history:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+// Teacher Attendance Endpoints
+app.get('/api/attendance/teachers', authenticateTeacher, async (req, res) => {
+    try {
+        const { date, teacherId } = req.query;
+        if (!date || !teacherId) return res.status(400).json({ error: 'Date and teacherId are required' });
+
+        if (teacherId !== req.teacher.teacherId) {
+            return res.status(403).json({ error: 'Unauthorized: You can only access your own attendance' });
+        }
+
+        const startOfDay = new Date(date);
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date(date);
+        endOfDay.setHours(23, 59, 59, 999);
+
+        const attendance = await TeacherAttendance.findOne({
+            teacherId,
+            date: { $gte: startOfDay, $lte: endOfDay }
+        });
+
+        res.json(attendance || {});
+    } catch (error) {
+        console.error('Error fetching teacher attendance:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+app.post('/api/attendance/teachers', authenticateTeacher, async (req, res) => {
+    try {
+        const { teacherId, date, status } = req.body;
+        if (!teacherId || !date || !status) {
+            return res.status(400).json({ error: 'Teacher ID, date, and status are required' });
+        }
+
+        if (teacherId !== req.teacher.teacherId) {
+            return res.status(403).json({ error: 'Unauthorized: You can only mark your own attendance' });
+        }
+
+        const startOfDay = new Date(date);
+        startOfDay.setHours(0, 0, 0, 0);
+        const endOfDay = new Date(date);
+        endOfDay.setHours(23, 59, 59, 999);
+
+        await TeacherAttendance.deleteOne({
+            teacherId,
+            date: { $gte: startOfDay, $lte: endOfDay }
+        });
+
+        const attendance = new TeacherAttendance({
+            teacherId,
+            date,
+            status
+        });
+        await attendance.save();
+
+        res.json({ success: true, message: 'Teacher attendance saved successfully' });
+    } catch (error) {
+        console.error('Error saving teacher attendance:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
+    }
+});
+
+app.get('/api/attendance/teachers/history/:teacherId', authenticateTeacher, async (req, res) => {
+    try {
+        if (req.params.teacherId !== req.teacher.teacherId) {
+            return res.status(403).json({ error: 'Unauthorized: You can only view your own attendance history' });
+        }
+
+        const attendance = await TeacherAttendance.find({
+            teacherId: req.params.teacherId
+        }).sort({ date: -1 });
+        res.json(attendance);
+    } catch (error) {
+        console.error('Error fetching teacher attendance history:', error);
+        res.status(500).json({ error: 'Internal server error', details: error.message });
     }
 });
 
